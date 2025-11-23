@@ -27,7 +27,7 @@ while True:
         right_shoulder = best_kpts[6]
 
         if np.any(left_shoulder == 0) or np.any(right_shoulder == 0):
-            cv2.imshow("Thorax", frame)
+            cv2.imshow("Thorax Detection - Single Person + Confidence", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             continue
