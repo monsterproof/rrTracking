@@ -1,3 +1,6 @@
 env/
 videos/
 yolov8n-pose.pt
+__pychache__/
+*.png
+*.pyc 
