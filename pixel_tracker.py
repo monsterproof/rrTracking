@@ -1,9 +1,184 @@
 import cv2
 import numpy as np
+import collections
 from collections import deque
 import matplotlib.pyplot as plt
 from scipy import signal
 from scipy.fft import fft, fftfreq
+from scipy.signal import butter, lfilter, detrend, filtfilt
+import time
+import collections
+
+
+class PulseRateEstimator:
+    """
+    Schätzt Pulsfrequenz (BPM) aus einem fortlaufenden PPG-ähnlichen Signal.
+    - Füge pro Frame einen Wert (ppg_value) hinzu
+    - Nach einigen Sekunden gibt update() eine BPM-Schätzung zurück (oder None)
+    """
+
+    def __init__(self, buffer_seconds=10, min_seconds=5):
+        self.buffer_seconds = buffer_seconds
+        self.min_seconds = min_seconds
+        self.values = collections.deque(maxlen=10000)
+        self.times = collections.deque(maxlen=10000)
+
+    def _bandpass(self, signal, fs, low_hz=0.7, high_hz=3.0, order=3):
+        nyq = 0.5 * fs
+        low = low_hz / nyq
+        high = high_hz / nyq
+        b, a = butter(order, [low, high], btype="band")
+        # filtfilt: zero-phase filtering
+        return filtfilt(b, a, signal)
+
+    def update(self, ppg_value, t=None):
+        """
+        ppg_value: Skalar aus deinem ROI (z.B. mean green)
+        t: optional Zeitstempel (Sekunden). Wenn None -> time.time()
+        return: geschätzte BPM oder None, wenn noch zu wenig Daten
+        """
+        if t is None:
+            t = time.time()
+
+        self.values.append(float(ppg_value))
+        self.times.append(float(t))
+
+        # Noch zu wenige Samples?
+        if len(self.values) < 10:
+            return None
+
+        # Nur letzten buffer_seconds betrachten
+        t_arr = np.array(self.times)
+        v_arr = np.array(self.values)
+
+        t_max = t_arr[-1]
+        t_min = max(t_arr[0], t_max - self.buffer_seconds)
+
+        # Daten im Zeitfenster auswählen
+        mask = t_arr >= t_min
+        t_arr = t_arr[mask]
+        v_arr = v_arr[mask]
+
+        duration = t_arr[-1] - t_arr[0]
+        if duration < self.min_seconds:
+            # noch nicht genug Historie
+            return None
+
+        # Ungleichmäßige Abtastung -> auf gleichmäßige Zeitachse resamplen
+        n_samples = len(t_arr)
+        fs_est = n_samples / duration  # geschätzte Samplingrate
+
+        t_uniform = np.linspace(t_arr[0], t_arr[-1], n_samples)
+        v_uniform = np.interp(t_uniform, t_arr, v_arr)
+
+        # Trend entfernen & bandpass filter
+        v_detr = detrend(v_uniform, type="linear")
+        v_filt = self._bandpass(v_detr, fs_est, low_hz=0.7, high_hz=3.0)
+
+        # FFT
+        freqs = np.fft.rfftfreq(len(v_filt), d=1.0 / fs_est)
+        spectrum = np.abs(np.fft.rfft(v_filt))
+
+        # Nur plausible Herzfrequenzen
+        mask = (freqs >= 0.7) & (freqs <= 3.0)
+        if not np.any(mask):
+            return None
+
+        dom_freq = freqs[mask][np.argmax(spectrum[mask])]
+        bpm = dom_freq * 60.0
+        return bpm
+
+class PulseAmplifier:
+    """
+    Einfacher rPPG / Eulerian-ähnlicher Verstärker für Puls:
+    - extrahiert aus einem ROI den mittleren Grünkanal
+    - bandpasst das 1D-Signal im Herzfrequenzbereich
+    - verstärkt die gefilterte Amplitude und schreibt sie zurück in den Grünkanal
+    """
+
+    def __init__(self, fs=30.0, lowcut=0.7, highcut=3.0, order=3,
+                 buffer_size=150, alpha=30.0):
+        """
+        fs         : Framerate (Hz)
+        lowcut     : untere Grenzfrequenz (z.B. 0.7 Hz ~ 42 bpm)
+        highcut    : obere Grenzfrequenz (z.B. 3.0 Hz ~ 180 bpm)
+        order      : Ordnung des Butterworth-Filters
+        buffer_size: Anzahl der Frames im Ringpuffer (Temporal Window)
+        alpha      : Verstärkungsfaktor für die Visualisierung
+        """
+        self.fs = fs
+        self.lowcut = lowcut
+        self.highcut = highcut
+        self.order = order
+        self.buffer_size = buffer_size
+        self.alpha = alpha
+
+        self._b, self._a = self._butter_bandpass(lowcut, highcut, fs, order)
+        self._signal_buffer = []  # 1D: mittlerer Grünwert pro Frame
+
+    def _butter_bandpass(self, lowcut, highcut, fs, order=3):
+        nyq = 0.5 * fs
+        low = lowcut / nyq
+        high = highcut / nyq
+        b, a = butter(order, [low, high], btype="band")
+        return b, a
+
+    def process(self, frame, x1, y1, x2, y2):
+        """
+        frame : BGR-Frame (np.ndarray)
+        (x1,y1,x2,y2): ROI-Koordinaten in Frame-Pixeln
+
+        Rückgabe:
+            amplified_roi : verstärktes ROI (BGR, uint8) oder None,
+            ppg_value     : letzter gefilterter Wert (float) oder None
+        """
+        # ROI extrahieren & bounds absichern
+        h, w = frame.shape[:2]
+        x1_cl = max(0, min(w-1, x1))
+        x2_cl = max(0, min(w,   x2))
+        y1_cl = max(0, min(h-1, y1))
+        y2_cl = max(0, min(h,   y2))
+
+        if x2_cl <= x1_cl or y2_cl <= y1_cl:
+            # leeres / invalider ROI
+            return None, None
+
+        roi = frame[y1_cl:y2_cl, x1_cl:x2_cl]
+
+        # in float umwandeln und auf 0..1 normieren
+        roi_f = roi.astype(np.float32) / 255.0
+
+        # Grünkanal extrahieren
+        g = roi_f[:, :, 1]
+
+        # 1D-Signal: Mittelwert über ROI
+        g_mean = float(g.mean())
+        self._signal_buffer.append(g_mean)
+
+        if len(self._signal_buffer) < self.buffer_size:
+            # noch nicht genug Historie für sinnvollen Filter
+            return roi.copy(), None
+
+        # Puffer auf feste Länge halten
+        if len(self._signal_buffer) > self.buffer_size:
+            self._signal_buffer.pop(0)
+
+        signal = np.array(self._signal_buffer, dtype=np.float32)
+
+        # Zeitliches Bandpass-Filtering
+        filtered = lfilter(self._b, self._a, signal)
+        latest_filtered = filtered[-1]
+
+        # Visualisierung: gefilterte Komponente verstärkt auf Grünkanal addieren
+        amplified_roi = roi_f.copy()
+        # gleicher Zusatz auf alle Pixel im Grünkanal
+        amplified_roi[:, :, 1] += self.alpha * latest_filtered
+
+        # Clipping & zurück zu uint8
+        amplified_roi = np.clip(amplified_roi, 0.0, 1.0)
+        amplified_roi_u8 = (amplified_roi * 255.0).astype(np.uint8)
+
+        return amplified_roi_u8, latest_filtered
 
 class PixelTracker:
     def __init__(self, roi_box, n_points=10, history_length=100, use_bg_subtraction=False, track_shoulders=False, fps=30):
@@ -300,16 +475,18 @@ class PixelTracker:
         # Apply filter (use filtfilt for zero phase delay)
         stage1_filtered = signal.filtfilt(b_low, a_low, signal_data)
         
-        # Stage 2: Bandpass filter for breathing (0.15 - 0.8 Hz)
-        # Typical breathing: 9-48 breaths/min = 0.15-0.8 Hz
-        breathing_low = 0.15 / nyquist
+        # Stage 2: Bandpass filter for breathing (0.08 - 0.8 Hz)
+        # Typical breathing: 5-48 breaths/min = 0.08-0.8 Hz
+        breathing_low = 0.08 / nyquist
         breathing_high = 0.8 / nyquist
         
         # Design 4th order Butterworth bandpass filter
         b_band, a_band = signal.butter(4, [breathing_low, breathing_high], btype='band')
         
         # Apply bandpass filter to extract breathing component
-        breathing_filtered = signal.filtfilt(b_band, a_band, stage1_filtered)
+        #breathing_filtered = signal.filtfilt(b_band, a_band, stage1_filtered)
+        breathing_filtered = stage1_filtered
+
         
         # Estimate breathing rate using FFT
         breathing_rate = self._estimate_breathing_rate(breathing_filtered)

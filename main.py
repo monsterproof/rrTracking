@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 import cv2
 import numpy as np
-from pixel_tracker import PixelTracker 
+from pixel_tracker import PixelTracker, PulseAmplifier, PulseRateEstimator
 
 model = YOLO("yolov8n-pose.pt")
 cap = cv2.VideoCapture(0)
@@ -22,6 +22,21 @@ print("Press 'q' to quit")
 print("Press 'p' to show/save plot")
 print("Press 'r' to reset tracking")
 
+
+
+pulse_mag = PulseAmplifier(
+    fs=30,
+    lowcut=0.7,
+    highcut=3.0,
+    buffer_size=150,  # 5 s bei 30 fps
+    alpha=30.0
+)
+
+pulse_est = PulseRateEstimator(buffer_seconds=10, min_seconds=5)
+
+
+
+
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -40,6 +55,9 @@ while True:
         # Keypoints
         left_shoulder = best_kpts[5]
         right_shoulder = best_kpts[6]
+        nose = best_kpts[0]
+        left_eye = best_kpts[1]
+        right_eye = best_kpts[2]
         
         if np.any(left_shoulder == 0) or np.any(right_shoulder == 0):
             cv2.imshow("Thorax Detection - Single Person + Confidence", frame)
@@ -63,8 +81,8 @@ while True:
         thorax_height = (hip_mid[1] - shoulder_mid[1]) * 0.5
         
         cx, cy = shoulder_mid
-        x1 = int(cx - thorax_width / 2 + thorax_width * 0.3)
-        x2 = int(cx + thorax_width / 2 - thorax_width * 0.3)
+        x1 = int(cx - thorax_width / 2 + (thorax_width * 0.2))
+        x2 = int(cx + thorax_width / 2 - (thorax_width * 0.2))
         y1 = int(cy)
         y2 = int(cy + thorax_height)
         
@@ -75,10 +93,67 @@ while True:
         y2 = min(frame.shape[0], y2)
         
         new_roi_box = (x1, y1, x2, y2)
+
         
+        # Augenabstand
+        eye_width = np.linalg.norm(right_eye - left_eye)
+
+        # Mittelpunkt der Augen
+        eyes_center = (left_eye + right_eye) / 2
+        ex, ey = eyes_center
+
+        # Forehead height (relative to face size)
+        forehead_height = int(eye_width * 0.6)
+
+        # Move ROI up so it is clearly above the eyes
+        vertical_offset = int(eye_width * 0.3)   # shift upward (adjust as needed)
+
+        # ROI Box (fully above the eyes)
+        fx1 = int(ex - eye_width / 2)
+        fx2 = int(ex + eye_width / 2)
+
+        fy2 = int(ey - vertical_offset)               # lower boundary (above the eyes)
+        fy1 = int(fy2 - forehead_height)              # upper boundary
+
+        # Clamp to top of frame
+        fy1 = max(fy1, 0)
+
+
+        # Clamp to frame boundaries
+        fx1 = max(0, fx1)
+        fy1 = max(0, fy1)
+        fx2 = min(frame.shape[1], fx2)
+        fy2 = min(frame.shape[0], fy2)
+
+        fROI = frame[fy1:fy2, fx1:fx2]
+
+        amplified_roi, ppg_value = pulse_mag.process(frame, fx1, fy1, fx2, fy2)
+        if amplified_roi is not None:
+             frame[fy1:fy2, fx1:fx2] = amplified_roi
+
+        #cv2.imshow("pulse_mag", frame)
+
+        bpm = None
+        if ppg_value is not None:
+            bpm = pulse_est.update(ppg_value)
+
+        if bpm is not None:
+            cv2.putText(
+                frame,
+                f"HR: {bpm:.1f} bpm",
+                (30, 100),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+            )
+    
+
+        # Draw the face ROI box
+        cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), (255, 0, 0), 2)
         # Initialize tracker on first valid frame OR if ROI changed significantly
         if tracker is None or prev_frame is None:
-            tracker = PixelTracker(new_roi_box, n_points=10, history_length=1800, use_bg_subtraction=False, track_shoulders=False, fps=fps)
+            tracker = PixelTracker(new_roi_box, n_points=20, history_length=1800, use_bg_subtraction=True, track_shoulders=False, fps=fps)
             if tracker.find_distinctive_points(frame):
                 roi_box = new_roi_box
                 # Initialize shoulder tracking
@@ -101,7 +176,7 @@ while True:
             else:
                 # Tracking failed - reinitialize
                 print("Tracking lost, reinitializing...")
-                tracker = PixelTracker(new_roi_box, n_points=10, history_length=1800, use_bg_subtraction=False, track_shoulders=False, fps=fps)
+                tracker = PixelTracker(new_roi_box, n_points=20, history_length=1800, use_bg_subtraction=True, track_shoulders=False, fps=fps)
                 if tracker.find_distinctive_points(frame):
                     roi_box = new_roi_box
                     tracker.update_shoulder_position(left_shoulder, right_shoulder)
@@ -129,6 +204,8 @@ while True:
         # Shoulder markers
         cv2.circle(frame, (int(left_shoulder[0]), int(left_shoulder[1])), 4, (0, 0, 255), -1)
         cv2.circle(frame, (int(right_shoulder[0]), int(right_shoulder[1])), 4, (0, 0, 255), -1)
+
+
         
         # Update previous frame
         prev_frame = frame.copy()
